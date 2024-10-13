@@ -1,0 +1,637 @@
+=== app/Models/Request.php ===
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Request extends Model
+{
+    use HasFactory;
+
+    protected $table = 'requests';
+
+    protected $fillable = [
+        'latitude',
+        'longitude',
+    ];
+
+    public function weatherData()
+    {
+        return $this->hasMany(WeatherData::class);
+    }
+}
+
+
+=== app/Models/User.php ===
+<?php
+
+namespace App\Models;
+
+// use Illuminate\Contracts\Auth\MustVerifyEmail;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+
+class User extends Authenticatable
+{
+    /** @use HasFactory<\Database\Factories\UserFactory> */
+    use HasFactory, Notifiable;
+
+    /**
+     * The attributes that are mass assignable.
+     *
+     * @var array<int, string>
+     */
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+    ];
+
+    /**
+     * The attributes that should be hidden for serialization.
+     *
+     * @var array<int, string>
+     */
+    protected $hidden = [
+        'password',
+        'remember_token',
+    ];
+
+    /**
+     * Get the attributes that should be cast.
+     *
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+        ];
+    }
+}
+
+
+=== app/Models/WeatherData.php ===
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class WeatherData extends Model
+{
+    use HasFactory;
+
+    protected $table = 'weather_data';
+
+    protected $fillable = [
+        'source',
+        'temperature',
+        'wind_speed',
+        'latitude',
+        'longitude',
+        'location',
+        'request_id' // Relación con la solicitud
+    ];
+
+    public function request()
+    {
+        return $this->belongsTo(Request::class);
+    }
+}
+
+
+=== app/Http/Controllers/Controller.php ===
+<?php
+
+namespace App\Http\Controllers;
+
+abstract class Controller
+{
+    //
+}
+
+
+=== app/Http/Controllers/WeatherController.php ===
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\WeatherData;
+use App\Models\Request as WeatherRequest; // Alias para evitar conflicto con Illuminate\Http\Request
+use App\Services\Adapters\WeatherAdapterFactory;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB; // Asegúrate de importar esta clase
+use Illuminate\Support\Facades\Cache; // Importa la fachada de Cache
+
+class WeatherController extends Controller
+{
+    public function show(Request $request)
+    {
+        // Verificar si el formulario ha sido enviado
+        if (!$request->has('lat') || !$request->has('lon')) {
+            // Si no hay latitud ni longitud en la solicitud, solo mostrar el formulario
+            return view('weather.show');
+        }
+
+        // Obtener los valores enviados por el usuario
+        $lat = $request->input('lat');
+        $lon = $request->input('lon');
+
+        // Crear una clave única para la caché usando latitud y longitud
+        $cacheKey = "weather_data_{$lat}_{$lon}";
+
+        // Intentar obtener datos del caché
+        $cachedData = Cache::get($cacheKey);
+
+        if ($cachedData) {
+            // Si hay datos en caché, usarlos
+            return view('weather.show', [
+                'averageTemperature' => $cachedData['averageTemperature'],
+                'averageWindSpeed' => $cachedData['averageWindSpeed'],
+                'apiData' => $cachedData['apiData']
+            ]);
+        }
+
+        // Iniciar una transacción
+        DB::beginTransaction();
+
+        try {
+            // Guardar la solicitud en la tabla `requests`
+            $weatherRequest = WeatherRequest::create([
+                'latitude' => $lat,
+                'longitude' => $lon
+            ]);
+
+            // Lista de fuentes de datos
+            $sources = ['OpenMeteo', 'WeatherAPI']; // Asegúrate de incluir BrightSky aquí
+            $temperatureTotal = 0;
+            $windSpeedTotal = 0;
+            $validSources = 0;
+            $apiData = [];
+
+            foreach ($sources as $source) {
+                $adapter = WeatherAdapterFactory::create($source);
+                $temperature = $adapter->getTemperature($lat, $lon);
+                $windSpeed = $adapter->getWindSpeed($lat, $lon);
+                $location = $adapter->getLocation($lat, $lon);
+                $url = $adapter->getRequestUrl($lat, $lon); // Obtener la URL de la API
+
+                // Almacenar los datos de la API, incluyendo la ubicación y la URL
+                if ($temperature !== null && $windSpeed !== null) {
+                    $apiData[$source] = [
+                        'temperature' => $temperature,
+                        'windSpeed' => $windSpeed,
+                        'location' => $location,
+                        'url' => $url // Añadir la URL aquí
+                    ];
+
+                    $temperatureTotal += $temperature;
+                    $windSpeedTotal += $windSpeed;
+                    $validSources++;
+
+                    // Guardar los datos en la tabla `weather_data`
+                    WeatherData::create([
+                        'request_id' => $weatherRequest->id, // Relación con la solicitud
+                        'source' => $source,
+                        'temperature' => $temperature,
+                        'wind_speed' => $windSpeed,
+                        'latitude' => $lat,
+                        'longitude' => $lon,
+                        'location' => $location
+                    ]);
+                }
+            }
+
+            // Comprobar si no se obtuvieron datos válidos de ninguna fuente
+            if ($validSources === 0) {
+                return redirect()->back()->with('error', 'There was a problem fetching the data, maybe the API did not find the location. Please try with another latitude and longitude.');
+            }
+
+            // Calcular los promedios
+            $averageTemperature = $temperatureTotal / $validSources;
+            $averageWindSpeed = $windSpeedTotal / $validSources;
+
+            // Almacenar los datos en caché por un tiempo definido (por ejemplo, 60 minutos)
+            Cache::put($cacheKey, [
+                'averageTemperature' => $averageTemperature,
+                'averageWindSpeed' => $averageWindSpeed,
+                'apiData' => $apiData
+            ], 60); // 60 minutos
+
+            // Confirmar la transacción
+            DB::commit();
+
+            // Pasar los datos a la vista
+            return view('weather.show', [
+                'averageTemperature' => $averageTemperature,
+                'averageWindSpeed' => $averageWindSpeed,
+                'apiData' => $apiData
+            ]);
+        } catch (\Exception $e) {
+            // Si ocurre un error, revertir la transacción
+            DB::rollBack();
+
+            // Manejar el error (puedes lanzar una excepción o mostrar un mensaje de error)
+            return redirect()->back()->with('error', 'There was a problem fetching the data, maybe the API did not find the location. Please try with another latitude and longitude.');
+        }
+    }
+}
+
+
+=== app/Console/Commands/WeatherConsumer.php ===
+<?php
+
+// app/Console/Commands/WeatherConsumer.php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use RdKafka\Consumer;
+use RdKafka\ConsumerTopic;
+
+class WeatherConsumer extends Command
+{
+    protected $signature = 'weather:consume';
+    protected $description = 'Consume weather data from Kafka';
+
+    public function handle()
+    {
+        $consumer = new Consumer();
+        $consumer->setLogLevel(LOG_DEBUG);
+        $consumer->addBrokers(config('kafka.brokers'));
+
+        $topic = $consumer->newTopic(config('kafka.topic'));
+        $topic->consumeStart(0, RD_KAFKA_OFFSET_END);
+
+        while (true) {
+            $message = $topic->consume(0, 1000);
+
+            if ($message->err) {
+                if ($message->err == RD_KAFKA_RESP_ERR__TIMED_OUT) {
+                    continue;
+                }
+                $this->error("Error consuming message: {$message->errstr()}");
+                break;
+            }
+
+            $data = json_decode($message->payload, true);
+            $this->info("Received weather data: Temperature: {$data['temperature']}, Wind Speed: {$data['wind_speed']} at {$data['location']}");
+        }
+    }
+}
+
+
+=== app/Console/Commands/WeatherProducer.php ===
+<?php
+
+// app/Console/Commands/WeatherProducer.php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use RdKafka\Producer;
+use App\Services\Adapters\WeatherAdapterFactory;
+
+class WeatherProducer extends Command
+{
+    protected $signature = 'weather:produce';
+    protected $description = 'Produce weather data to Kafka';
+
+    public function handle()
+    {
+        $locations = [
+            ['lat' => 55, 'lon' => 13],
+        ];
+
+        foreach ($locations as $location) {
+            $temperatureTotal = 0;
+            $windSpeedTotal = 0;
+            $sources = ['BrightSky', 'OpenMeteo', 'WeatherAPI'];
+
+            foreach ($sources as $source) {
+                $adapter = WeatherAdapterFactory::create($source);
+                $temperature = $adapter->getTemperature($location['lat'], $location['lon']);
+                $windSpeed = $adapter->getWindSpeed($location['lat'], $location['lon']);
+
+                if ($temperature !== null && $windSpeed !== null) {
+                    $temperatureTotal += $temperature;
+                    $windSpeedTotal += $windSpeed;
+
+                    $data = json_encode([
+                        'temperature' => $temperature,
+                        'wind_speed' => $windSpeed,
+                        'location' => $adapter->getLocation($location['lat'], $location['lon']),
+                    ]);
+
+                    $this->produceMessage($data);
+                }
+            }
+
+            $averageTemperature = $temperatureTotal / count($sources);
+            $averageWindSpeed = $windSpeedTotal / count($sources);
+
+            // Produce average data as well, if required
+            $this->produceMessage(json_encode([
+                'temperature' => $averageTemperature,
+                'wind_speed' => $averageWindSpeed,
+                'location' => 'Average Location',
+            ]));
+        }
+
+        $this->info('Weather data produced successfully.');
+    }
+
+    protected function produceMessage($data)
+    {
+        $producer = new Producer();
+        $producer->addBrokers(config('kafka.brokers'));
+
+        $topic = $producer->newTopic(config('kafka.topic'));
+        $topic->produce(RD_KAFKA_PARTITION_UA, 0, $data);
+
+        $producer->poll(0);
+    }
+}
+
+
+=== app/Services/Adapters/BrightSkyAdapter.php ===
+<?php
+
+namespace App\Services\Adapters;
+
+use GuzzleHttp\Client;
+
+class BrightSkyAdapter implements WeatherAdapterInterface // Implementando la interfaz
+{
+    protected $client;
+    private $baseUrl = 'https://api.brightsky.dev/current_weather'; // Definimos la URL base
+
+    public function __construct()
+    {
+        $this->client = new Client(['verify' => false]); // Desactiva la verificación SSL
+    }
+
+    public function getTemperature(float $lat, float $lon): ?float // Ajustado a la firma de la interfaz
+    {
+        $response = $this->client->get($this->baseUrl, [
+            'query' => [
+                'lat' => $lat,
+                'lon' => $lon,
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true);
+        return $data['current_weather']['temperature'] ?? null; // Ajusta esto según tu API
+    }
+
+    public function getWindSpeed(float $lat, float $lon): ?float // Ajustado a la firma de la interfaz
+    {
+        $response = $this->client->get($this->baseUrl, [
+            'query' => [
+                'lat' => $lat,
+                'lon' => $lon,
+            ],
+        ]);
+
+        $data = json_decode($response->getBody(), true);
+        return $data['current_weather']['wind_speed'] ?? null; // Ajusta esto según tu API
+    }
+
+    public function getLocation(float $lat, float $lon): ?string // Ajustado a la firma de la interfaz
+    {
+        return "The API doesn't provide us with the city name of the location."; // Ajusta esto según tu lógica
+    }
+
+    public function getRequestUrl(float $lat, float $lon): string // Implementación del nuevo método
+    {
+        return "{$this->baseUrl}?lat={$lat}&lon={$lon}"; // Construir y devolver la URL de la solicitud
+    }
+}
+
+
+=== app/Services/Adapters/OpenMeteoAdapter.php ===
+<?php
+
+namespace App\Services\Adapters;
+
+use GuzzleHttp\Client;
+
+class OpenMeteoAdapter implements WeatherAdapterInterface
+{
+    private $client;
+    private $baseUrl = 'https://api.open-meteo.com/v1/forecast';
+
+    public function __construct()
+    {
+        $this->client = new Client();
+    }
+
+    public function getTemperature(float $lat, float $lon, $options = []): ?float
+    {
+        $response = $this->client->get("{$this->baseUrl}?latitude={$lat}&longitude={$lon}&current=temperature_2m,wind_speed_10m", array_merge($options, [
+            'verify' => false, // Deshabilitar la verificación SSL aquí
+        ]));
+        $data = json_decode($response->getBody(), true);
+        return $data['current']['temperature_2m'] ?? null;
+    }
+
+    public function getWindSpeed(float $lat, float $lon, $options = []): ?float
+    {
+        $response = $this->client->get("{$this->baseUrl}?latitude={$lat}&longitude={$lon}&current=temperature_2m,wind_speed_10m", array_merge($options, [
+            'verify' => false, // Deshabilitar la verificación SSL aquí
+        ]));
+        $data = json_decode($response->getBody(), true);
+        return $data['current']['wind_speed_10m'] ?? null;
+    }
+
+    public function getLocation(float $lat, float $lon): ?string
+    {
+        return "The API doesn't provide us with the city name of the location."; // Puede personalizarse si es necesario
+    }
+
+    public function getRequestUrl(float $lat, float $lon): string // Implementación del nuevo método
+    {
+        return "{$this->baseUrl}?latitude={$lat}&longitude={$lon}&current=temperature_2m,wind_speed_10m";
+    }
+}
+
+
+=== app/Services/Adapters/WeatherAPIAdapter.php ===
+<?php
+
+namespace App\Services\Adapters;
+
+use GuzzleHttp\Client;
+
+class WeatherAPIAdapter implements WeatherAdapterInterface
+{
+    private $client;
+    private $baseUrl = 'https://api.weatherapi.com/v1/current.json';
+    private $apiKey;
+
+    public function __construct()
+    {
+        // Crear el cliente Guzzle con la opción 'verify' desactivada
+        $this->client = new Client(['verify' => false]);
+        $this->apiKey = config('services.weatherapi.key');
+    }
+
+    public function getTemperature(float $lat, float $lon): ?float
+    {
+        // Deshabilitar verificación SSL en la solicitud
+        $response = $this->client->get("{$this->baseUrl}?key={$this->apiKey}&q={$lat},{$lon}", [
+            'verify' => false,
+        ]);
+        $data = json_decode($response->getBody(), true);
+        return $data['current']['temp_c'] ?? null;
+    }
+
+    public function getWindSpeed(float $lat, float $lon): ?float
+    {
+        // Deshabilitar verificación SSL en la solicitud
+        $response = $this->client->get("{$this->baseUrl}?key={$this->apiKey}&q={$lat},{$lon}", [
+            'verify' => false,
+        ]);
+        $data = json_decode($response->getBody(), true);
+        return $data['current']['wind_kph'] ?? null;
+    }
+
+    public function getLocation(float $lat, float $lon): ?string
+    {
+        // Deshabilitar verificación SSL en la solicitud
+        $response = $this->client->get("{$this->baseUrl}?key={$this->apiKey}&q={$lat},{$lon}", [
+            'verify' => false,
+        ]);
+        $data = json_decode($response->getBody(), true);
+        return $data['location']['name'] ?? null;
+    }
+
+    public function getRequestUrl(float $lat, float $lon): string // Implementación del nuevo método
+    {
+        return "{$this->baseUrl}?key={$this->apiKey}&q={$lat},{$lon}";
+    }
+}
+
+
+=== app/Services/Adapters/WeatherAdapterFactory.php ===
+<?php
+// app/Services/Adapters/WeatherAdapterFactory.php
+
+namespace App\Services\Adapters;
+
+class WeatherAdapterFactory
+{
+    public static function create(string $source): WeatherAdapterInterface
+    {
+        return match ($source) {
+            'BrightSky' => new BrightSkyAdapter(),
+            'OpenMeteo' => new OpenMeteoAdapter(),
+            'WeatherAPI' => new WeatherAPIAdapter(),
+            default => throw new \InvalidArgumentException("Unknown API source: {$source}"),
+        };
+    }
+}
+
+
+=== app/Services/Adapters/WeatherAdapterInterface.php ===
+<?php
+
+namespace App\Services\Adapters;
+
+interface WeatherAdapterInterface
+{
+    public function getTemperature(float $lat, float $lon): ?float;
+    public function getWindSpeed(float $lat, float $lon): ?float;
+    public function getLocation(float $lat, float $lon): ?string;
+    public function getRequestUrl(float $lat, float $lon): string; // Nuevo método
+}
+
+
+=== routes/api.php ===
+
+<?php
+
+
+use Illuminate\Support\Facades\Route;
+
+use App\Http\Controllers\WeatherController;
+
+
+Route::get('/weather', [WeatherController::class, 'index']);
+Route::get('/weather/average', [WeatherController::class, 'getAverage']);
+
+
+=== routes/console.php ===
+<?php
+
+use Illuminate\Foundation\Inspiring;
+use Illuminate\Support\Facades\Artisan;
+
+Artisan::command('inspire', function () {
+    $this->comment(Inspiring::quote());
+})->purpose('Display an inspiring quote')->hourly();
+
+
+=== routes/web(mal).php ===
+<?php
+
+use Illuminate\Support\Facades\Route;
+
+
+use App\Http\Controllers\WeatherController;
+
+
+
+
+
+
+Route::get('/', [WeatherController::class, 'show'])->name('weather.show');
+Route::get('/weather/data', [WeatherController::class, 'index']); // Ruta para obtener todos los datos
+Route::get('/weather/average', [WeatherController::class, 'getAverage']); // Ruta para obtener el promedio
+
+
+
+
+
+
+
+
+=== routes/web.php ===
+<?php
+
+use Illuminate\Support\Facades\Route;
+
+
+use App\Http\Controllers\WeatherController;
+
+
+
+
+
+
+Route::get('/', [WeatherController::class, 'show'])->name('weather.show');
+
+
+
+Route::get('/documentation', function () {
+    return view('documentation');
+})->name('documentation');
+
+
+
+Route::get('/weather/data', [WeatherController::class, 'index']); // Ruta para obtener todos los datos
+Route::get('/weather/average', [WeatherController::class, 'getAverage']); // Ruta para obtener el promedio
+
+
+
+
+
+
+
+
