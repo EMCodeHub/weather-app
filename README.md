@@ -47,6 +47,13 @@ DB_USERNAME=your_username
 DB_PASSWORD=your_password
 
 
+Important add this to the .env document
+
+KAFKA_BROKER=localhost:9092
+KAFKA_TOPIC=weather
+WEATHERAPI_KEY=2d093f92eb494259860135409241010
+
+
 
 ### 6. Run Database Migrations
 
